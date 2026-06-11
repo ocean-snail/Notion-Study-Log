@@ -2,12 +2,21 @@ import { Client, isFullBlock, isFullPage } from "@notionhq/client";
 import { NotionToMarkdown } from "notion-to-md";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-const NOTION_TOKEN = requireEnv("NOTION_TOKEN");
-const ROOT_PAGE_ID = requireEnv("NOTION_ROOT_PAGE_ID");
+// Structurally identical to notion-to-md's MdBlock (the package is CJS
+// without an "exports" map, so a deep type import doesn't resolve cleanly).
+export type MdBlock = {
+  type?: string;
+  blockId: string;
+  parent: string;
+  children: MdBlock[];
+};
+
 const OUTPUT_DIR = process.env.OUTPUT_DIR ?? "notion";
 
-const notion = new Client({ auth: NOTION_TOKEN });
+// auth may be undefined when imported by tests; validated in main().
+const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 // parseChildPages: false → each page is converted on its own; we handle
 // recursion ourselves so we can mirror the page tree as folders/files.
@@ -317,9 +326,55 @@ n2m.setCustomTransformer("table", async (block) => {
 
 // ---------- export ----------
 
-async function pageToMarkdown(pageId: string): Promise<string> {
+// Block types where notion-to-md handles children correctly:
+//   - list items / to_do: markdown indentation is real nesting
+//   - toggle: wrapped in <details>; quote: prefixed with ">"
+//   - callout: children already embedded by blockToMarkdown
+//   - synced_block / column_list / column: children rendered un-indented
+// For ANY other type (toggle headings, paragraphs with indented children,
+// ...), the library indents children by 4 spaces, which markdown renders as
+// a CODE BLOCK — i.e. unformatted plain text. We hoist those children out
+// to siblings instead.
+const HANDLES_OWN_CHILDREN = new Set([
+  "bulleted_list_item",
+  "numbered_list_item",
+  "to_do",
+  "toggle",
+  "quote",
+  "callout",
+  "synced_block",
+  "column_list",
+  "column",
+]);
+
+export function hoistNonNestableChildren(blocks: MdBlock[]): MdBlock[] {
+  const out: MdBlock[] = [];
+  for (const block of blocks) {
+    const children = hoistNonNestableChildren(block.children ?? []);
+    if (children.length > 0 && !HANDLES_OWN_CHILDREN.has(block.type ?? "")) {
+      out.push({ ...block, children: [] }, ...children);
+    } else {
+      out.push({ ...block, children });
+    }
+  }
+  return out;
+}
+
+// notion-to-md emits toggles as <details><summary>…</summary> with NO blank
+// line before the body. Per CommonMark/GitHub rules, content inside an HTML
+// block is NOT parsed as markdown unless separated by blank lines — so
+// toggle bodies showed up as literal plain text. Insert the blank lines.
+export function fixToggleSpacing(markdown: string): string {
+  return markdown
+    .replace(/<\/summary>\n+/g, "</summary>\n\n")
+    .replace(/\n+<\/details>/g, "\n\n</details>");
+}
+
+export async function pageToMarkdown(pageId: string): Promise<string> {
   const mdBlocks = await n2m.pageToMarkdown(pageId);
-  return n2m.toMarkdownString(mdBlocks).parent ?? "";
+  const normalized = hoistNonNestableChildren(mdBlocks);
+  const markdown = n2m.toMarkdownString(normalized).parent ?? "";
+  return fixToggleSpacing(markdown);
 }
 
 // Recursively export a page and all of its descendants.
@@ -395,23 +450,29 @@ async function exportDatabase(
 }
 
 async function main(): Promise<void> {
-  const rootTitle = await getPageTitle(ROOT_PAGE_ID);
+  requireEnv("NOTION_TOKEN");
+  const rootPageId = requireEnv("NOTION_ROOT_PAGE_ID");
+
+  const rootTitle = await getPageTitle(rootPageId);
   console.log(`Exporting "${rootTitle}" → ${OUTPUT_DIR}/`);
 
   // Wipe the output dir so pages deleted in Notion also disappear from git.
   await fs.rm(OUTPUT_DIR, { recursive: true, force: true });
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
 
-  const total = await exportPage(
-    ROOT_PAGE_ID,
-    rootTitle,
-    OUTPUT_DIR,
-    new Set(),
-  );
+  const total = await exportPage(rootPageId, rootTitle, OUTPUT_DIR, new Set());
   console.log(`Done. Exported ${total} page(s).`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only run when executed directly (tsx export-notion.ts), not when imported.
+const isMain =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+export { n2m };
