@@ -4,7 +4,7 @@ on:
   schedule:
     # 01:00 UTC daily.
     # London: 1 AM in winter (GMT), 2 AM in summer (BST) — DST shift is fine.
-    - cron: "0 1 * * *"
+    - cron: "6 1 * * *"
   workflow_dispatch: {} # allows manual runs from the Actions tab
 
 permissions:
